@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="UTF-8" />
+    <title>EAI Lab5 ─ FP32 vs INT8 Web Demo</title>
+    <!-- ONNX Runtime Web -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 900px;
+        margin: 20px auto;
+        padding: 10px;
+      }
+      h1 {
+        margin-bottom: 10px;
+      }
+      #preview {
+        max-width: 150px;
+        border: 1px solid #ccc;
+        margin-top: 10px;
+      }
+      .block {
+        border: 1px solid #ddd;
+        padding: 12px;
+        margin-top: 15px;
+        border-radius: 8px;
+        background: #fafafa;
+      }
+      pre {
+        background: #111;
+        color: #0f0;
+        padding: 8px;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+    </style>
+  </head>
+
+  <body>
+    <h1>EAI Lab5 ─ CIFAR-10 FP32 vs INT8 (Browser)</h1>
+    <p>
+      上傳一張圖片，瀏覽器會載入
+      <code>image_classifier_model.onnx</code> 和
+      <code>image_classifier_model_int8.onnx</code>，
+      分別做推論並顯示 Top-3 結果與推論時間，最後計算 Speedup。
+    </p>
+
+    <input type="file" id="fileInput" accept="image/*" />
+    <br />
+    <img id="preview" alt="preview image" />
+
+    <div class="block">
+      <h2>FP32 Output</h2>
+      <pre id="fp32_result">尚未推論</pre>
+    </div>
+
+    <div class="block">
+      <h2>INT8 Output</h2>
+      <pre id="int8_result">尚未推論</pre>
+    </div>
+
+    <div class="block">
+      <h2>Speedup</h2>
+      <pre id="speedup_result">尚未推論</pre>
+    </div>
+
+    <script>
+      // === 和你 Python 一樣的 CIFAR-10 標籤 & normalize 參數 ===
+      const LABELS = [
+        "plane",
+        "car",
+        "bird",
+        "cat",
+        "deer",
+        "dog",
+        "frog",
+        "horse",
+        "ship",
+        "truck",
+      ];
+      const MEAN = [0.4914, 0.4822, 0.4465];
+      const STD = [0.247, 0.2435, 0.2616];
+
+      let sessFP32 = null;
+      let sessINT8 = null;
+
+      async function initSessions() {
+        try {
+          // 兩個模型與 index.html 在同一層
+          sessFP32 = await ort.InferenceSession.create(
+            "image_classifier_model.onnx"
+          );
+          sessINT8 = await ort.InferenceSession.create(
+            "image_classifier_model_int8.onnx"
+          );
+          console.log("FP32 & INT8 sessions loaded.");
+        } catch (e) {
+          console.error("Failed to load sessions:", e);
+          alert("載入 ONNX 模型失敗，請檢查檔案路徑與名稱。");
+        }
+      }
+
+      // softmax
+      function softmax(arr) {
+        const max = Math.max(...arr);
+        const exps = arr.map((v) => Math.exp(v - max));
+        const sum = exps.reduce((a, b) => a + b, 0);
+        return exps.map((v) => v / sum);
+      }
+
+      // 影像 → (1,3,32,32) tensor
+      async function imageToTensor(img) {
+        const canvas = document.createElement("canvas");
+        const ctx = canvas.getContext("2d");
+        const H = 32;
+        const W = 32;
+        canvas.width = W;
+        canvas.height = H;
+
+        // resize 到 32x32
+        ctx.drawImage(img, 0, 0, W, H);
+
+        const imgData = ctx.getImageData(0, 0, W, H).data; // RGBA
+        const out = new Float32Array(1 * 3 * H * W);
+
+        for (let y = 0; y < H; y++) {
+          for (let x = 0; x < W; x++) {
+            const idx = (y * W + x) * 4;
+            const r = imgData[idx] / 255;
+            const g = imgData[idx + 1] / 255;
+            const b = imgData[idx + 2] / 255;
+
+            const r_n = (r - MEAN[0]) / STD[0];
+            const g_n = (g - MEAN[1]) / STD[1];
+            const b_n = (b - MEAN[2]) / STD[2];
+
+            const base = y * W + x;
+            out[0 * H * W + base] = r_n; // C=0
+            out[1 * H * W + base] = g_n; // C=1
+            out[2 * H * W + base] = b_n; // C=2
+          }
+        }
+
+        // shape = [1,3,32,32]
+        return new ort.Tensor("float32", out, [1, 3, H, W]);
+      }
+
+      function formatTop3(probs, timeMs) {
+        const pairs = probs
+          .map((p, i) => [p, i])
+          .sort((a, b) => b[0] - a[0])
+          .slice(0, 3);
+
+        let txt = `推論時間：${timeMs.toFixed(2)} ms\n\n`;
+        pairs.forEach(([p, idx], rank) => {
+          txt += `${rank + 1}. ${LABELS[idx]} : ${p.toFixed(4)}\n`;
+        });
+        return txt;
+      }
+
+      async function runInference(img) {
+        try {
+          if (!sessFP32 || !sessINT8) {
+            await initSessions();
+          }
+
+          const inputTensor = await imageToTensor(img);
+
+          // input 名稱假設是 "input"，輸出名稱是 "logits"
+          const feeds = { input: inputTensor };
+
+          const t0 = performance.now();
+          const outFP32 = await sessFP32.run(feeds);
+          const t1 = performance.now();
+          const outINT8 = await sessINT8.run(feeds);
+          const t2 = performance.now();
+
+          const fp32_ms = t1 - t0;
+          const int8_ms = t2 - t1;
+
+          const fp32_logits = Array.from(outFP32.logits.data);
+          const int8_logits = Array.from(outINT8.logits.data);
+
+          const fp32_probs = softmax(fp32_logits);
+          const int8_probs = softmax(int8_logits);
+
+          document.getElementById("fp32_result").textContent = formatTop3(
+            fp32_probs,
+            fp32_ms
+          );
+          document.getElementById("int8_result").textContent = formatTop3(
+            int8_probs,
+            int8_ms
+          );
+          document.getElementById(
+            "speedup_result"
+          ).textContent = `FP32 / INT8 Speedup = ${(fp32_ms / int8_ms).toFixed(
+            2
+          )} 倍`;
+        } catch (e) {
+          console.error(e);
+          alert("推論時發生錯誤，請打開 console 查看詳細訊息。");
+        }
+      }
+
+      // 綁定事件
+      document.addEventListener("DOMContentLoaded", () => {
+        initSessions();
+
+        const input = document.getElementById("fileInput");
+        const preview = document.getElementById("preview");
+
+        input.addEventListener("change", (e) => {
+          const file = e.target.files[0];
+          if (!file) return;
+          const url = URL.createObjectURL(file);
+          preview.src = url;
+          preview.onload = () => runInference(preview);
+        });
+      });
+    </script>
+  </body>
+</html>
